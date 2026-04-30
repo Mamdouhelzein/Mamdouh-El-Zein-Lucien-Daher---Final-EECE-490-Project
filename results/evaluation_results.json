@@ -1,1 +1,42 @@
-
+{
+  "model": "forest_lens_v2",
+  "test_set": "balanced (540 images)",
+  "overall": {
+    "precision": 0.915,
+    "recall": 0.921,
+    "mAP50": 0.948,
+    "mAP50_95": 0.747
+  },
+  "per_class": {
+    "deer": {
+      "precision": 0.889,
+      "recall": 0.899,
+      "mAP50": 0.918,
+      "mAP50_95": 0.739
+    },
+    "boar": {
+      "precision": 0.868,
+      "recall": 0.866,
+      "mAP50": 0.914,
+      "mAP50_95": 0.685
+    },
+    "rabbit": {
+      "precision": 0.896,
+      "recall": 0.943,
+      "mAP50": 0.953,
+      "mAP50_95": 0.654
+    },
+    "jackal": {
+      "precision": 0.971,
+      "recall": 0.903,
+      "mAP50": 0.966,
+      "mAP50_95": 0.824
+    },
+    "pheasant": {
+      "precision": 0.95,
+      "recall": 0.991,
+      "mAP50": 0.988,
+      "mAP50_95": 0.834
+    }
+  }
+}
