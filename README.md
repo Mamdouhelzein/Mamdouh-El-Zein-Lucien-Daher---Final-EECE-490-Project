@@ -28,6 +28,11 @@ Lucien Daher
 
 ---
 
+## Demo Video
+
+[Click here to view files on Google Drive](https://drive.google.com/drive/folders/1O-9Wbvuy3f7lR71IX25wXVICt2VA-3G8?usp=drive_link)
+
+
 ## Project Overview
 
 WildTrack AI is an artificial intelligence based wildlife detection system.
