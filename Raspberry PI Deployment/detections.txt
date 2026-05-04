@@ -1,2 +1,0 @@
-# WildTrack Detection Log
-# Format: timestamp\tspecies\tconfidence\tlegal_status
