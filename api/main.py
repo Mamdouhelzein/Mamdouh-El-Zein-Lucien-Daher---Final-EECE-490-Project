@@ -1,18 +1,23 @@
-# api/main.py
-import io
-import time
-from datetime import datetime
-from pathlib import Path
+"""
+api/main.py
+FastAPI for Raspberry Pi deployment.
+Serves live camera feed, detection results, history, and the permanent log file.
+"""
 
-import cv2
-import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from PIL import Image
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+import cv2
+import numpy as np
+import io
+import time
+
+from model.detect import state, start_detection, LEGALITY, DETECTION_LOG_TXT, DETECTION_LOG_CSV
 from ultralytics import YOLO
 
-app = FastAPI(title="WildTrack AI API", version="2.0")
+app = FastAPI(title="WildTrack AI — Pi Edition", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,176 +26,145 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH = "best.pt"
-CONF_THRESHOLD = 0.35
-IMG_SIZE = 640
-
-LEGALITY = {
-    "deer":     "legal",
-    "boar":     "legal",
-    "rabbit":   "legal",
-    "pheasant": "legal",
-    "jackal":   "illegal",
-}
-
-# ── Load model once at startup ─────────────────────────────────────────────────
-model = None
+if Path("ui").exists():
+    app.mount("/ui", StaticFiles(directory="ui"), name="ui")
 
 @app.on_event("startup")
 async def startup():
-    global model
-    model = YOLO(MODEL_PATH)
-    print(f"✓ Model loaded from {MODEL_PATH}")
+    print("Starting detection loop...")
+    start_detection()
+    print("✓ WildTrack AI running on Raspberry Pi")
 
-# ── Preprocessing — exactly matches training pipeline ─────────────────────────
-def preprocess(image_bytes: bytes) -> np.ndarray:
-    """
-    Preprocess image exactly like our training data:
-    1. Decode image
-    2. Resize to 640x640
-    3. Apply CLAHE normalization (same as training)
-    """
-    # Decode
+# ── Health ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    with state.lock:
+        return {
+            "status":           "ok",
+            "running":          state.running,
+            "total_frames":     state.total_frames,
+            "total_detections": state.total_detections,
+            "fps":              state.fps,
+            "motion_state":     state.motion_state,
+            "motion_pct":       state.motion_pct,
+        }
+
+# ── Latest result ──────────────────────────────────────────────────────────────
+@app.get("/latest")
+def get_latest():
+    with state.lock:
+        if state.latest_result is None:
+            return {"status": "waiting", "message": "No frames captured yet"}
+        return state.latest_result
+
+# ── History ────────────────────────────────────────────────────────────────────
+@app.get("/history")
+def get_history(limit: int = 20):
+    with state.lock:
+        return {
+            "results": state.history[-limit:],
+            "total":   len(state.history)
+        }
+
+# ── Permanent detection log (download) ─────────────────────────────────────────
+@app.get("/log")
+def download_log():
+    """Download the permanent detection log file."""
+    if not DETECTION_LOG.exists():
+        return JSONResponse(status_code=404, content={"error": "No log file found"})
+    return FileResponse(
+        path=DETECTION_LOG,
+        media_type="text/plain",
+        filename="wildtrack_detections.txt"
+    )
+
+@app.get("/log/view")
+def view_log():
+    """View the detection log as plain text in the browser."""
+    if not DETECTION_LOG.exists():
+        return JSONResponse(status_code=404, content={"error": "No log file found"})
+    content = DETECTION_LOG.read_text(encoding="utf-8")
+    return HTMLResponse(f"<pre style='font-family:monospace;padding:2rem;'>{content}</pre>")
+
+# ── Frame endpoints ────────────────────────────────────────────────────────────
+@app.get("/frame/raw")
+def get_raw_frame():
+    with state.lock:
+        jpg = state.latest_frame_jpg
+    if jpg is None:
+        return JSONResponse(status_code=503, content={"error": "No frame available yet"})
+    return StreamingResponse(io.BytesIO(jpg), media_type="image/jpeg")
+
+@app.get("/frame/annotated")
+def get_annotated_frame():
+    with state.lock:
+        jpg = state.latest_annotated_jpg
+    if jpg is None:
+        return JSONResponse(status_code=503, content={"error": "No frame available yet"})
+    return StreamingResponse(io.BytesIO(jpg), media_type="image/jpeg")
+
+@app.get("/stream")
+def mjpeg_stream():
+    """MJPEG live stream of annotated frames."""
+    def generate():
+        while True:
+            with state.lock:
+                jpg = state.latest_annotated_jpg
+            if jpg:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                )
+            time.sleep(0.1)
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace;boundary=frame"
+    )
+
+# ── Manual detect (upload image) ───────────────────────────────────────────────
+_manual_model = None
+
+@app.post("/detect")
+async def detect_upload(file: UploadFile = File(...)):
+    global _manual_model
+    if _manual_model is None:
+        _manual_model = YOLO("best.pt")
+
+    image_bytes = await file.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is None:
-        raise ValueError("Could not decode image")
+        return JSONResponse(status_code=400, content={"error": "Invalid image"})
 
-    # Resize to 640x640
-    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-
-    # Apply CLAHE — exactly as done during dataset preparation
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    return img
-
-# ── Health check ───────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "model_path": MODEL_PATH,
-        "confidence_threshold": CONF_THRESHOLD
-    }
-
-# ── Classes ────────────────────────────────────────────────────────────────────
-@app.get("/classes")
-def get_classes():
-    return {
-        "species": list(LEGALITY.keys()),
-        "legality": LEGALITY
-    }
-
-# ── Main detection endpoint ────────────────────────────────────────────────────
-@app.post("/detect")
-async def detect(file: UploadFile = File(...)):
-    """
-    Detect wildlife in uploaded image.
-    Applies same preprocessing as training data for maximum confidence.
-    """
-    if model is None:
-        return JSONResponse(status_code=503, content={"error": "Model not loaded"})
-
-    # Read image bytes
-    image_bytes = await file.read()
-
-    # Preprocess — same as training pipeline
-    try:
-        img_processed = preprocess(image_bytes)
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-    # Run inference
-    t0 = time.time()
-    results = model.predict(
-        source  = img_processed,
-        conf    = CONF_THRESHOLD,
-        verbose = False
-    )
-    latency_ms = round((time.time() - t0) * 1000, 1)
-
+    img_resized = cv2.resize(img, (640, 640))
+    results = _manual_model.predict(img_resized, conf=0.35, verbose=False)
     result = results[0]
-    detections = []
-    privacy_alert = False
 
+    detections = []
     for box in result.boxes:
         class_id   = int(box.cls[0])
         confidence = float(box.conf[0])
-        species    = model.names.get(class_id, "unknown")
-        bbox       = [round(v, 1) for v in box.xyxy[0].tolist()]
-        legal      = LEGALITY.get(species, "illegal")
-
-        if species == "human":
-            privacy_alert = True
-
+        species    = _manual_model.names.get(class_id, "unknown")
         detections.append({
             "species":    species,
             "confidence": round(confidence, 4),
-            "bbox":       bbox,
-            "legal":      legal
+            "bbox":       [round(v, 1) for v in box.xyxy[0].tolist()],
+            "legal":      LEGALITY.get(species, "illegal")
         })
 
     return {
         "image":          file.filename,
         "animal_present": len(detections) > 0,
         "detections":     detections,
-        "privacy_alert":  privacy_alert,
-        "timestamp":      datetime.now().isoformat(),
-        "latency_ms":     latency_ms,
         "empty_frame":    len(detections) == 0
     }
 
-# ── Batch detection ────────────────────────────────────────────────────────────
-@app.post("/detect/batch")
-async def detect_batch(files: list[UploadFile] = File(...)):
-    """Detect wildlife in multiple images."""
-    if len(files) > 50:
-        return JSONResponse(status_code=400, content={"error": "Max 50 images per batch"})
-
-    results_out = []
-    for file in files:
-        image_bytes = await file.read()
-        try:
-            img_processed = preprocess(image_bytes)
-        except Exception as e:
-            results_out.append({"image": file.filename, "error": str(e)})
-            continue
-
-        results = model.predict(img_processed, conf=CONF_THRESHOLD, verbose=False)
-        result  = results[0]
-        detections = []
-
-        for box in result.boxes:
-            class_id   = int(box.cls[0])
-            confidence = float(box.conf[0])
-            species    = model.names.get(class_id, "unknown")
-            legal      = LEGALITY.get(species, "illegal")
-
-            detections.append({
-                "species":    species,
-                "confidence": round(confidence, 4),
-                "bbox":       [round(v, 1) for v in box.xyxy[0].tolist()],
-                "legal":      legal
-            })
-
-        results_out.append({
-            "image":          file.filename,
-            "animal_present": len(detections) > 0,
-            "detections":     detections,
-            "timestamp":      datetime.now().isoformat(),
-            "empty_frame":    len(detections) == 0
-        })
-
-    return {
-        "results": results_out,
-        "total":   len(results_out),
-        "animals_found": sum(1 for r in results_out if r.get("animal_present"))
-    }
+# ── Root → redirect to UI ──────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return HTMLResponse("""
+    <html><head><meta http-equiv="refresh" content="0;url=/ui/index.html"></head>
+    <body>Redirecting to WildTrack AI dashboard...</body></html>
+    """)
